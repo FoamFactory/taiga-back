@@ -2,7 +2,7 @@
 
 ## 6.1.1 (unreleased)
 
-- ...
+- Change api response from 404 to 401 when not logged in
 
 ## 6.1.0 (2021-05-04)
 
