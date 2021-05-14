@@ -10,6 +10,7 @@ import uuid
 from django.utils import timezone
 from django.db import models
 from django.contrib.auth import get_user_model
+from django.contrib.postgres.indexes import BrinIndex
 from django.utils.functional import cached_property
 from taiga.base.db.models.fields import JSONField
 
@@ -324,3 +325,6 @@ class HistoryEntry(models.Model):
 
     class Meta:
         ordering = ["created_at"]
+        indexes = (
+           BrinIndex(fields=['created_at'], name='historyentry__createdat__brin'),
+        )
