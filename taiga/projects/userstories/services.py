@@ -25,6 +25,7 @@ from taiga.celery import app
 from taiga.events import events
 from taiga.projects.history.services import take_snapshot
 from taiga.projects.models import Project, UserStoryStatus, Swimlane
+from taiga.projects.milestones.models import Milestone
 from taiga.projects.notifications.utils import attach_watchers_to_queryset
 from taiga.projects.services import apply_order_updates
 from taiga.projects.tasks.models import Task
@@ -134,6 +135,101 @@ def reset_userstories_kanban_order_in_bulk(project: Project,
                               projectid=project.id)
 
 
+def update_userstories_backlog_or_sprint_order_in_bulk(project: Project,
+                                                       bulk_userstories: List[int],
+                                                       before_userstory: Optional[models.UserStory] = None,
+                                                       after_userstory: Optional[models.UserStory] = None,
+                                                       milestone: Optional[Milestone] = None):
+    """
+    Updates the order of the userstories specified adding the extra updates
+    needed to keep consistency.
+
+    Note: `after_userstory_id` and `before_userstory_id` are mutually exclusive;
+          you can use only one at a given request. They can be both None which
+          means "at the beginning of is cell"
+
+     - `bulk_userstories` should be a list of user stories IDs
+    """
+    order_param = "backlog_order"
+
+    # filter user stories from milestone
+    user_stories = project.user_stories.all()
+    if milestone is not None:
+         user_stories = user_stories.filter(milestone=milestone)
+         order_param = "sprint_order"
+    else:
+         user_stories = user_stories.filter(milestone__isnull=True)
+
+    # exclude moved user stories
+    user_stories = user_stories.exclude(id__in=bulk_userstories)
+
+    # if before_userstory, get it and all elements before too:
+    if before_userstory:
+        user_stories = (user_stories.filter(**{f"{order_param}__gte": getattr(before_userstory, order_param)}))
+    # if after_userstory, exclude it and get only elements after it:
+    elif after_userstory:
+        user_stories = (user_stories.exclude(id=after_userstory.id)
+                                    .filter(**{f"{order_param}__gte": getattr(after_userstory, order_param)}))
+
+    # sort and get only ids
+    user_story_ids = (user_stories.order_by(order_param, "id")
+                                  .values_list('id', flat=True))
+
+    # append moved user stories
+    user_story_ids = bulk_userstories + list(user_story_ids)
+
+    # calculate the start order
+    if before_userstory:
+        # order start with the before_userstory order
+        start_order = getattr(before_userstory, order_param)
+    elif after_userstory:
+        # order start after the after_userstory order
+        start_order = getattr(after_userstory, order_param) + 1
+    else:
+        # move at the beggining of the column if there is no after and before
+        start_order = 1
+
+    # prepare rest of data
+    total_user_stories = len(user_story_ids)
+
+    user_story_milestone_ids = (milestone.id if milestone else None,) * total_user_stories
+    user_story_orders = range(start_order, start_order + total_user_stories)
+
+    data = tuple(zip(user_story_ids,
+                     user_story_milestone_ids,
+                     user_story_orders))
+
+    # execute query for update milestone and backlog or sprint order
+    sql = f"""
+    UPDATE userstories_userstory
+       SET milestone_id = tmp.new_milestone_id::BIGINT,
+           {order_param} = tmp.new_order::BIGINT
+      FROM (VALUES %s) AS tmp (id, new_milestone_id, new_order)
+     WHERE tmp.id = userstories_userstory.id
+    """
+    with connection.cursor() as cursor:
+        execute_values(cursor, sql, data)
+
+    # TODO: Update is_closed attr for related milestones
+    #if settings.CELERY_ENABLED:
+    #    update_open_or_close_conditions_if_status_has_been_changed.delay(bulk_userstories)
+    #else:
+    #    update_open_or_close_conditions_if_status_has_been_changed(bulk_userstories)
+
+    # Sent events of updated stories
+    events.emit_event_for_ids(ids=user_story_ids,
+                              content_type="userstories.userstory",
+                              projectid=project.pk)
+
+    # Generate response with modified info
+    res = ({
+        "id": id,
+        "milestone": milestone,
+        order_param: order
+    } for (id, milestone, order) in data)
+    return res
+
+
 def update_userstories_kanban_order_in_bulk(project: Project,
                                             status: UserStoryStatus,
                                             bulk_userstories: List[int],
@@ -210,7 +306,7 @@ def update_userstories_kanban_order_in_bulk(project: Project,
     with connection.cursor() as cursor:
         execute_values(cursor, sql, data)
 
-    # Update is_closed attr for UserStories adn related milestones
+    # Update is_closed attr for UserStories and related milestones
     if settings.CELERY_ENABLED:
         update_open_or_close_conditions_if_status_has_been_changed.delay(bulk_userstories)
     else:
